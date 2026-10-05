@@ -85,6 +85,49 @@ def successful_takes(takes_dir=TAKES):
     return out
 
 
+FILTERS = {"safe successes": lambda e: e["status"] == "success" and e["safe"],
+           "successes": lambda e: e["status"] == "success",
+           "all takes": lambda e: True}
+
+
+def take_entry(path):
+    """Catalog row of a take from its meta.json (cheap; the motion is loaded only when viewed)."""
+    path = os.path.abspath(path)
+    m = load_meta(path)
+    parts = os.path.basename(path).split("__")
+    stamp = parts[-1] if len(parts) >= 4 else ""
+    date = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}" if len(stamp) >= 8 else "unknown date"
+    operator = m.get("operator") or (parts[2] if len(parts) >= 4 else "?")
+    return dict(path=path, id=os.path.basename(path), meta=m, scene_json=scene_json_of(path, m),
+                scene_id=m["scene_id"], session=f"{date} · {operator}", date=date, stamp=stamp,
+                status=m.get("status", "?"), safe=bool(m.get("safe")), seg=m["segment"],
+                pov=os.path.exists(os.path.join(path, "pov.mp4")))
+
+
+def entry_label(e):
+    s = e["seg"]
+    flags = (" · safe" if e["safe"] else "") + (" · POV" if e["pov"] else "")
+    return (f"seg {s['index']} · route {s['route_id']} · {e['meta'].get('duration_s', 0):.1f} s · "
+            f"{e['status']}{flags} · {e['stamp'][-6:]}")
+
+
+def catalog(takes_dir=TAKES, paths=None):
+    """Every take (or the given ones) whose scene is available here."""
+    out = []
+    for p in paths if paths is not None else [os.path.join(takes_dir, d) for d in sorted(os.listdir(takes_dir))]:
+        if not (os.path.exists(os.path.join(p, "meta.json")) and os.path.exists(os.path.join(p, "motion.npz"))):
+            continue
+        try:
+            e = take_entry(p)
+        except (OSError, ValueError, KeyError):
+            continue
+        if not os.path.exists(e["scene_json"]):
+            print(f"skipped {e['id']}: scene file {e['scene_json']} not here")
+            continue
+        out.append(e)
+    return out
+
+
 def pose(x, y, yaw):
     T = np.eye(4)
     T[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
@@ -135,7 +178,7 @@ class Take:
         self.meta = m = load_meta(self.path)
         self.scene_json = scene_json_of(self.path, m)
         z = self.z = dict(np.load(os.path.join(self.path, "motion.npz")))
-        Ti = np.array(m["T_scene_from_xr"])
+        Ti = self.T_scene_from_xr = np.array(m["T_scene_from_xr"])
         self.seg, self.margin = m["segment"], m["hand_margin"]
         self.t = z["t"] - z["t"][0]
         self.n = n = len(self.t)
@@ -187,8 +230,8 @@ class Take:
         p = retarget_path(self.scene_json, self.id)
         self.g1 = dict(np.load(p)) if os.path.exists(p) else None
 
-    def pov_frames(self, width=480):
-        """Decoded POV frames (RGB, scaled to width), loaded on first use."""
+    def pov_frames(self):
+        """POV frames as JPEG bytes (decoded with pov_image), loaded on first use."""
         if self._pov_frames is None and self.pov_t is not None:
             import cv2
             cap, frames = cv2.VideoCapture(self.pov_file), []
@@ -196,10 +239,19 @@ class Take:
                 ok, img = cap.read()
                 if not ok:
                     break
-                h, w = img.shape[:2]
-                frames.append(cv2.cvtColor(cv2.resize(img, (width, int(h * width / w))), cv2.COLOR_BGR2RGB))
+                frames.append(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes())
             self._pov_frames = frames
         return self._pov_frames or []
+
+    def pov_index(self, i):
+        """The POV frame shown at tracking frame i: the latest one at or before its time."""
+        n = len(self.pov_frames())
+        return int(np.clip(np.searchsorted(self.pov_t, self.t[i], side="right") - 1, 0, n - 1)) if n else -1
+
+    def pov_image(self, k):
+        import cv2
+        return cv2.cvtColor(cv2.imdecode(np.frombuffer(self._pov_frames[k], np.uint8), cv2.IMREAD_COLOR),
+                            cv2.COLOR_BGR2RGB)
 
     def glitch_intervals(self, s):
         g = self.glitch.get(s)
@@ -270,46 +322,75 @@ def prepare(takes):
         print(f"retargeted {tk.id}: wrist error median/max {err}")
 
 
-def serve(take_paths, port):
+def serve(entries, port, initial_filter="safe successes", rescan=None):
+    """One viewer for every take in entries (catalog rows): session, scene and take are chosen in the
+    panel; the room is rebuilt when the scene changes."""
     import viser
     import viser.transforms as tf
     from . import furniture
 
-    takes = sorted((Take(p) for p in take_paths), key=lambda k: (k.seg["route_id"], k.seg["route_s0_m"], k.id))
-    scene_json = takes[0].scene_json
-    assert all(k.scene_json == scene_json for k in takes), "one server per scene"
-    bundle = bundle_dir(scene_json)
-    if not os.path.exists(os.path.join(bundle, "robot.glb")):
-        raise SystemExit(f"no viewer bundle for this scene; run first (branch env):\n"
-                         f"  python -m mtc_capture.view_take prepare {takes[0].path}")
-    scene = furniture.load(scene_json)
-    data = scene.data
+    if not entries:
+        raise SystemExit("no takes to show")
+    takes_cache = {}
 
+    def get_take(e):
+        if e["path"] not in takes_cache:
+            takes_cache[e["path"]] = Take(e["path"])
+        return takes_cache[e["path"]]
+
+    ctx = dict(scene_json=None, scene=None, T_start_inv=np.eye(4), entries=[], labels=[], busy=False)
     server = viser.ViserServer(host="127.0.0.1", port=port, label="MTC take replay")
     server.scene.set_up_direction("+z")
     server.scene.world_axes.visible = False
     server.scene.configure_default_lights(enabled=True, cast_shadow=True)
-    server.gui.configure_theme(control_layout="floating", control_width="medium", dark_mode=False,
+    server.gui.configure_theme(control_layout="floating", control_width="large", dark_mode=False,
                                show_logo=False, show_share_button=False, brand_color=(16, 114, 122))
 
-    # room (same look as view_furniture.py)
-    width, depth, _ = data["room_dimensions"]
-    server.scene.add_box("/floor", dimensions=(width + .2, depth + .2, .04), position=(width / 2, depth / 2, -.03),
-                         color=(229, 234, 237), receive_shadow=True)
     palette = {"tabletop": (177, 124, 67), "table_leg": (77, 69, 62), "chair_seat": (26, 116, 130),
                "chair_back": (27, 121, 134), "chair_leg": (42, 66, 74), "chair_armrest": (32, 91, 101),
                "wall": (125, 144, 155), "overhead": (228, 161, 62), "item": (217, 83, 79), "plank": (202, 164, 114),
                "crate": (141, 110, 79), "support": (92, 92, 92), "cabinet": (127, 140, 141), "door": (176, 137, 104),
                "partition": (149, 165, 166), "lamp": (244, 227, 161), "plant": (77, 138, 69),
                "shelf_edge": (160, 120, 76)}
-    walls = server.scene.add_frame("/walls", show_axes=False)
-    for b in data["boxes"]:
-        is_wall = b["category"] == "wall"
-        server.scene.add_box(f"/{'walls' if is_wall else 'furniture'}/{b['name']}",
-                             dimensions=tuple(2 * np.asarray(b["half_size"])), position=tuple(b["center"]),
-                             wxyz=tf.SO3.from_z_radians(b.get("yaw", 0.0)).wxyz,
-                             color=palette.get(b["category"], (115, 102, 84)),
-                             opacity=.15 if is_wall else 1., cast_shadow=not is_wall, receive_shadow=True)
+
+    def build_room(scene_json):
+        """Furniture, walls and floor of a scene (same look as view_furniture.py), and the static G1 fallback."""
+        if ctx.get("room") is not None:
+            ctx["room"].remove()
+        ctx["scene"] = furniture.load(scene_json)
+        data = ctx["scene"].data
+        ctx["room"] = server.scene.add_frame("/room", show_axes=False)
+        width, depth, _ = data["room_dimensions"]
+        server.scene.add_box("/room/floor", dimensions=(width + .2, depth + .2, .04),
+                             position=(width / 2, depth / 2, -.03), color=(229, 234, 237), receive_shadow=True)
+        ctx["walls"] = server.scene.add_frame("/room/walls", show_axes=False, visible=show_walls.value)
+        for b in data["boxes"]:
+            is_wall = b["category"] == "wall"
+            server.scene.add_box(f"/room/{'walls' if is_wall else 'furniture'}/{b['name']}",
+                                 dimensions=tuple(2 * np.asarray(b["half_size"])), position=tuple(b["center"]),
+                                 wxyz=tf.SO3.from_z_radians(b.get("yaw", 0.0)).wxyz,
+                                 color=palette.get(b["category"], (115, 102, 84)),
+                                 opacity=.15 if is_wall else 1., cast_shadow=not is_wall, receive_shadow=True)
+        ctx["T_start_inv"] = np.linalg.inv(pose(*data["start"]))
+        glb = os.path.join(bundle_dir(scene_json), "robot.glb")
+        if ctx.get("static_mesh") is not None:
+            ctx["static_mesh"].remove()
+        ctx["static_mesh"] = server.scene.add_glb("/g1/static/mesh", open(glb, "rb").read()) if os.path.exists(glb) \
+            else None
+        # collision overlays, per box: bright red = in contact at this frame, light red = touched in this take
+        ctx["box_asset"] = list(ctx["scene"].asset_of_box)
+        ctx["hit"], ctx["touched"] = {}, {}
+        for k, b in enumerate(data["boxes"]):
+            dims = tuple(2 * np.asarray(b["half_size"]) + .006)
+            kw = dict(position=tuple(b["center"]), wxyz=tf.SO3.from_z_radians(b.get("yaw", 0.0)).wxyz,
+                      cast_shadow=False, receive_shadow=False, visible=False)
+            a = ctx["box_asset"][k]
+            ctx["hit"].setdefault(a, []).append(server.scene.add_box(f"/room/hit/{k}", dimensions=dims,
+                                                                     color=(230, 20, 20), opacity=.95, **kw))
+            ctx["touched"].setdefault(a, []).append(server.scene.add_box(f"/room/touched/{k}", dimensions=dims,
+                                                                         color=(240, 90, 90), opacity=.45, **kw))
+        ctx["hit_on"], ctx["touched_on"] = set(), set()
+        ctx["scene_json"] = scene_json
 
     # every take: its segment route and head path on the floor (faint), the current one highlighted
     def lines(name, pts, color, thickness):
@@ -317,13 +398,30 @@ def serve(take_paths, port):
         if len(pts) > 1:
             return server.scene.add_line_segments(name, np.stack([pts[:-1], pts[1:]], axis=1),
                                                   colors=color, thickness=thickness)
-    overview = server.scene.add_frame("/all_takes", show_axes=False)
-    for k, tk in enumerate(takes):
-        col = SEGMENT_COLORS[tk.seg["index"] % len(SEGMENT_COLORS)]
-        route = np.column_stack([np.asarray(tk.seg["route"], float), np.full(len(tk.seg["route"]), .02)])
-        lines(f"/all_takes/{k}/route", route, col, .02)
-        lines(f"/all_takes/{k}/head", tk.heads * [1, 1, 0] + [0, 0, .03], col, .004)
-        server.scene.add_label(f"/all_takes/{k}/label", f"seg {tk.seg['index']}", position=tuple(route[0] + [0, 0, .2]))
+    def build_overview(rows):
+        """Routes of the listed takes (one per segment), labelled, and the overview cameras."""
+        if ctx.get("overview") is not None:
+            ctx["overview"].remove()
+        ctx["overview"] = server.scene.add_frame("/all_takes", show_axes=False, visible=show_all.value)
+        done = set()
+        for e in rows:
+            seg = e["seg"]
+            key = (seg["route_id"], seg["index"])
+            if key in done:
+                continue
+            done.add(key)
+            col = SEGMENT_COLORS[seg["index"] % len(SEGMENT_COLORS)]
+            route = np.column_stack([np.asarray(seg["route"], float), np.full(len(seg["route"]), .02)])
+            name = f"/all_takes/r{seg['route_id']}_s{seg['index']}"
+            lines(name + "/route", route, col, .02)
+            server.scene.add_label(name + "/label", f"seg {seg['index']}", position=tuple(route[0] + [0, 0, .2]))
+        pts = np.vstack([np.asarray(e["seg"]["route"], float) for e in rows])
+        mid, span = pts.mean(0), max(np.ptp(pts, axis=0).max(), 2.0)
+        sx, sy, syaw = rows[0]["seg"]["start"]
+        fx, fy = np.cos(syaw), np.sin(syaw)
+        ctx["overview_cam"] = ((mid[0] - .9 * span * fx + .5 * span * fy, mid[1] - .9 * span * fy - .5 * span * fx,
+                                .9 * span + 1), (mid[0], mid[1], .6))
+        ctx["top_cam"] = ((mid[0], mid[1], 1.6 * span + 2), (mid[0] + 1e-3, mid[1], 0.0))
 
     current = {"frame": None}
 
@@ -350,13 +448,11 @@ def serve(take_paths, port):
 
     # G1: articulated links driven by the arm retarget (arm_ik.py); without one, the baked
     # default pose moved under the head
-    links_dir = os.path.join(bundle, "g1_links")
-    rig = json.load(open(os.path.join(links_dir, "links.json"))) if os.path.exists(
-        os.path.join(links_dir, "links.json")) else None
+    links_dir = next((os.path.join(bundle_dir(sj), "g1_links") for sj in dict.fromkeys(e["scene_json"] for e in entries)
+                      if os.path.exists(os.path.join(bundle_dir(sj), "g1_links", "links.json"))), None)
+    rig = json.load(open(os.path.join(links_dir, "links.json"))) if links_dir else None
     robot = server.scene.add_frame("/g1", show_axes=False)
     static = server.scene.add_frame("/g1/static", show_axes=False)
-    server.scene.add_glb("/g1/static/mesh", open(os.path.join(bundle, "robot.glb"), "rb").read())
-    T_start_inv = np.linalg.inv(pose(*data["start"]))
     link_h, coll_h, hl_h = {}, {}, {}
     collision_frame = server.scene.add_frame("/g1/collision", show_axes=False)
     halo, halo_frame = {}, server.scene.add_frame("/hand_halo", show_axes=False)
@@ -425,17 +521,26 @@ def serve(take_paths, port):
                  for s in SIDES}
 
     # gui
-    labels = [tk.label for tk in takes]
-    with server.gui.add_folder("Take", expand_by_default=True):
-        pick = server.gui.add_dropdown("Take", labels, initial_value=labels[0])
-        auto = server.gui.add_checkbox("Auto-advance", initial_value=len(takes) > 1)
+    filters = [f for f in FILTERS if any(FILTERS[f](e) for e in entries)] or list(FILTERS)
+    with server.gui.add_folder("Session", expand_by_default=True):
+        flt = server.gui.add_dropdown("Show", filters, initial_value=initial_filter if initial_filter in filters
+                                      else filters[0])
+        sess = server.gui.add_dropdown("Session", ("-",))
+        scn = server.gui.add_dropdown("Scene", ("-",))
+        pick = server.gui.add_dropdown("Take", ("-",))
+        auto = server.gui.add_checkbox("Auto-advance", initial_value=True)
+        reload_btn = server.gui.add_button("Reload takes (new captures)", icon=viser.Icon.REFRESH,
+                                           disabled=rescan is None)
         info = server.gui.add_markdown("")
-    with server.gui.add_folder("POV (headset view)", expand_by_default=True):
+    pov_btn = server.gui.add_button("Hide POV video", icon=viser.Icon.EYE_OFF)
+    pov_on = {"v": True}
+    pov_folder = server.gui.add_folder("POV (headset view)", expand_by_default=True)
+    with pov_folder:
         pov_img = server.gui.add_image(np.full((360, 480, 3), 40, np.uint8), label="operator view", format="jpeg",
                                        jpeg_quality=80)
         pov_note = server.gui.add_markdown("")
     with server.gui.add_folder("Playback", expand_by_default=True):
-        slider = server.gui.add_slider("Frame", min=0, max=max(takes[0].n - 1, 1), step=1, initial_value=0)
+        slider = server.gui.add_slider("Frame", min=0, max=1, step=1, initial_value=0)
         playing = server.gui.add_checkbox("Play", initial_value=True)
         speed = server.gui.add_dropdown("Speed", ("0.25", "0.5", "1", "2"), initial_value="1")
         readout = server.gui.add_markdown("")
@@ -444,6 +549,8 @@ def serve(take_paths, port):
         show_hl = server.gui.add_checkbox("Highlight G1 hands (colour, halo, path)", initial_value=True)
         show_coll = server.gui.add_checkbox("G1 arm collision geoms (clearance colour)", initial_value=False)
         follow_cam = server.gui.add_checkbox("Camera follows the robot", initial_value=False)
+        show_screen = server.gui.add_checkbox("POV video screen beside the robot", initial_value=True)
+        show_frustum = server.gui.add_checkbox("POV camera at the head", initial_value=True)
         show_tracked = server.gui.add_checkbox("Tracked wrists + finger joints", initial_value=True)
         show_body = server.gui.add_checkbox("Tracked body (PICO skeleton, G1 scale)", initial_value=True)
         show_skel = server.gui.add_checkbox("G1 skeleton (robot links as lines)", initial_value=True)
@@ -451,13 +558,34 @@ def serve(take_paths, port):
         show_walls = server.gui.add_checkbox("Walls", initial_value=True)
         show_trails = server.gui.add_checkbox("Trails (current take)", initial_value=True)
         show_all = server.gui.add_checkbox("All takes (routes, head paths)", initial_value=True)
+        hit_robot = server.gui.add_checkbox("Red objects: G1 contact", initial_value=True)
+        hit_proxy = server.gui.add_checkbox("Red objects: capture-proxy contact", initial_value=True)
+        hit_touched = server.gui.add_checkbox("Light red: objects touched in this take", initial_value=True)
+    def pov_toggle(_):
+        screen_frame.visible = pov_on["v"] and show_screen.value
+        frustum_frame.visible = pov_on["v"] and show_frustum.value
+        pov_state["k"] = -1                                   # redraw the current frame into what is shown
+        with lock:
+            draw(int(slider.value))
+    show_screen.on_update(pov_toggle)
+    show_frustum.on_update(pov_toggle)
+
+    @pov_btn.on_click
+    def _(_):
+        pov_on["v"] = not pov_on["v"]
+        pov_folder.visible = pov_on["v"]
+        pov_btn.label = "Hide POV video" if pov_on["v"] else "Show POV video"
+        pov_btn.icon = viser.Icon.EYE_OFF if pov_on["v"] else viser.Icon.EYE
+        pov_toggle(None)
     proxy_frame.visible = False
     collision_frame.visible = False
     show_hl.on_update(lambda e: (setattr(halo_frame, "visible", e.target.value),
                                  setattr(current["hand_trails"], "visible", e.target.value)))
     for cb, handle in ((show_robot, robot), (show_coll, collision_frame), (show_tracked, tracked_frame), (show_body, body_frame),
-                       (show_proxy, proxy_frame), (show_walls, walls), (show_all, overview)):
+                       (show_proxy, proxy_frame)):
         cb.on_update(lambda e, handle=handle: setattr(handle, "visible", e.target.value))
+    show_walls.on_update(lambda e: setattr(ctx["walls"], "visible", e.target.value) if ctx.get("walls") else None)
+    show_all.on_update(lambda e: setattr(ctx["overview"], "visible", e.target.value) if ctx.get("overview") else None)
     show_trails.on_update(lambda e: setattr(current["trails"], "visible", e.target.value))
     server.gui.add_markdown("G1 arms follow the tracked wrists by IK (7 DoF per arm); the base follows the head; "
                             "the feet follow the tracked ankles (native app takes) or planned steps. Orange "
@@ -473,7 +601,7 @@ def serve(take_paths, port):
             h.visible = k == st
 
     def name(asset):
-        return scene.labels.get(int(asset), "-") if asset >= 0 else "-"
+        return ctx["scene"].labels.get(int(asset), "-") if asset >= 0 else "-"
 
     def quat_mul(a, b):
         w1, x1, y1, z1 = a
@@ -482,7 +610,7 @@ def serve(take_paths, port):
                          w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
 
     lock = threading.RLock()
-    cur = {"take": takes[0]}
+    cur = {"take": None}
 
     bones = [("pelvis", "left_hip"), ("left_hip", "left_knee"), ("left_knee", "left_ankle"), ("left_ankle", "left_foot"),
              ("pelvis", "right_hip"), ("right_hip", "right_knee"), ("right_knee", "right_ankle"),
@@ -494,6 +622,9 @@ def serve(take_paths, port):
 
     skel_frame = server.scene.add_frame("/g1skel", show_axes=False)
     pov_state = {"k": -1, "take": None}
+    screen_frame = server.scene.add_frame("/pov_screen", show_axes=False)
+    frustum_frame = server.scene.add_frame("/pov_frustum", show_axes=False)
+    screen, frustum = {}, {}
 
     def draw_skeleton(tk, i):
         g1 = tk.g1
@@ -509,20 +640,43 @@ def serve(take_paths, port):
                                          point_shape="circle")
 
     def draw_pov(tk, i):
+        if not pov_on["v"]:                                   # hidden: no decoding, nothing sent
+            return
         if tk.pov_t is None:
             if pov_state["take"] is not tk:
                 pov_img.image = np.full((360, 480, 3), 40, np.uint8)
                 pov_note.content = "no POV video in this take (recorded before the app streamed it)"
                 pov_state.update(take=tk, k=-1)
             return
-        frames = tk.pov_frames()
-        if not frames:
+        k = tk.pov_index(i)
+        if k < 0:
             return
-        k = int(np.clip(np.searchsorted(tk.pov_t, tk.t[i]), 0, len(frames) - 1))
         if k != pov_state["k"] or pov_state["take"] is not tk:
-            pov_img.image = frames[k]
-            pov_note.content = f"frame {k + 1}/{len(frames)} · t {tk.pov_t[k]:.2f} s (tracking t {tk.t[i]:.2f} s)"
+            img = tk.pov_image(k)
+            pov_img.image = img
+            if show_screen.value:
+                screen["image"] = server.scene.add_image("/pov_screen/image", img, 0.96, 0.96 * img.shape[0] / img.shape[1],
+                                                         format="jpeg", jpeg_quality=85, cast_shadow=False,
+                                                         receive_shadow=False)
+            if show_frustum.value:
+                frustum["handle"] = server.scene.add_camera_frustum(
+                    "/pov_frustum/cam", fov=1.1, aspect=img.shape[1] / img.shape[0], scale=0.28, image=img,
+                    format="jpeg", jpeg_quality=80, color=(16, 114, 122), variant="filled", cast_shadow=False)
+            pov_note.content = (f"frame {k + 1}/{len(tk.pov_frames())} · video t {tk.pov_t[k]:.2f} s · "
+                                f"tracking t {tk.t[i]:.2f} s")
             pov_state.update(take=tk, k=k)
+        # the frustum sits at the tracked head, looking where the headset looked (OpenCV camera axes)
+        R = C.rot_to_scene(tk.T_scene_from_xr, tk.z["head_xr"][i][:3, :3]) @ np.diag([1.0, -1.0, -1.0])
+        frustum_frame.position, frustum_frame.wxyz = tuple(tk.heads[i]), tuple(wxyz_from_matrix(R))
+        # the screen travels beside the robot, facing a camera behind it
+        if tk.g1 is not None:
+            base, yaw = tk.g1["qpos"][i, :2], tk.g1["yaw"][i]
+        else:
+            base, yaw = tk.heads[i, :2], tk.yaws[i]
+        c, s_ = np.cos(yaw), np.sin(yaw)
+        fwd, left = np.array([c, s_, 0.0]), np.array([-s_, c, 0.0])
+        screen_frame.position = tuple(np.r_[base, 0.0] + 0.25 * fwd + 0.85 * left + [0, 0, 1.3])
+        screen_frame.wxyz = tuple(wxyz_from_matrix(np.column_stack([-left, [0, 0, -1.0], fwd])))
 
     def draw_body(tk, i):
         if tk.body is None:
@@ -597,7 +751,7 @@ def serve(take_paths, port):
             errs = [f"{s} {g1[f'{s}_pos_err'][i] * 100:.1f} cm" for s in SIDES if np.isfinite(g1[f"{s}_pos_err"][i])]
             out.append("wrist IK error: " + (", ".join(errs) or "-") + "  (>3 cm: beyond the G1's reach)")
         else:
-            T = pose(head[0], head[1], yaw) @ T_start_inv
+            T = pose(head[0], head[1], yaw) @ ctx["T_start_inv"]
             robot.position = (T[0, 3], T[1, 3], 0.0)
             robot.wxyz = tf.SO3.from_z_radians(np.arctan2(T[1, 0], T[0, 0])).wxyz
             out.append("no arm retarget for this take: run `view_take prepare`")
@@ -638,32 +792,164 @@ def serve(take_paths, port):
                 joints_pc[s].points = h["joints"][i].astype(np.float32)
             out.append(f"{s}: hand {h['clear_hand'][i]:+.3f} · forearm {h['clear_forearm'][i]:+.3f} m "
                        f"({name(h['near_hand'][i])})")
+        draw_contacts(tk, i, out)
         readout.content = "  \n".join(out)
+
+    def take_contacts(tk):
+        """Per frame: (assets the G1 collision geoms penetrate, assets the capture proxy penetrates)."""
+        if getattr(tk, "_contacts", None) is None:
+            robot = [set() for _ in range(tk.n)]
+            proxy = [set() for _ in range(tk.n)]
+            g1, box_asset = tk.g1, ctx["box_asset"]
+            if g1 is not None:
+                boxes = [int(str(n).rsplit("_", 1)[1]) for n in g1["furniture_names"]]
+                for key in [k for k in g1 if k.startswith("clear_")]:
+                    near = g1["near_" + key[6:]]
+                    for i in np.flatnonzero(g1[key] < 0):
+                        if near[i] >= 0:
+                            robot[i].add(box_asset[boxes[int(near[i])]])
+            for key in [k for k in tk.z if k.startswith("clear_") and "near_" + k[6:] in tk.z]:
+                d, near = tk.z[key], tk.z["near_" + key[6:]]
+                for i in np.flatnonzero(np.isfinite(d) & (d < 0)):
+                    if near[i] >= 0:
+                        proxy[i].add(int(near[i]))
+            tk._contacts = robot, proxy
+        return tk._contacts
+
+    def draw_contacts(tk, i, out):
+        robot, proxy = take_contacts(tk)
+        now = (robot[i] if hit_robot.value else set()) | (proxy[i] if hit_proxy.value else set())
+        ever = set()
+        if hit_touched.value:
+            for frames, on in ((robot, hit_robot.value), (proxy, hit_proxy.value)):
+                if on:
+                    ever |= set().union(*frames)
+        ever -= now
+        for key, want in (("hit", now), ("touched", ever)):
+            have = ctx[key + "_on"]
+            for a in have - want:
+                for h in ctx[key].get(a, []):
+                    h.visible = False
+            for a in want - have:
+                for h in ctx[key].get(a, []):
+                    h.visible = True
+            ctx[key + "_on"] = set(want)
+        if now:
+            who = [f"{name(a)} ({'G1' if a in robot[i] else ''}{'+' if a in robot[i] and a in proxy[i] else ''}"
+                   f"{'proxy' if a in proxy[i] else ''})" for a in sorted(now)]
+            out.append("**CONTACT:** " + ", ".join(who))
+
+    def redraw(_):
+        if cur["take"] is not None:
+            with lock:
+                draw(int(slider.value))
+    for cb in (hit_robot, hit_proxy, hit_touched):
+        cb.on_update(redraw)
 
     def select(k):
         with lock:
-            tk = takes[k]
+            e = ctx["entries"][k]
+            info.content = f"loading {e['id']} …"
+            tk = get_take(e)
             cur["take"] = tk
             build_current(tk)
             info.content = tk.summary()
             slider.max = max(tk.n - 1, 1)
             slider.value = 0
+            pov_state["k"] = -1
             draw(0)
 
-    pick.on_update(lambda e: select(labels.index(pick.value)))
+    def set_options(dd, options, keep=None):
+        options = tuple(options) or ("-",)
+        dd.options = options
+        dd.value = keep if keep in options else options[0]
+
+    def visible_entries():
+        return [e for e in entries if FILTERS[flt.value](e)]
+
+    def refresh_sessions():
+        rows = visible_entries()
+        names = sorted({e["session"] for e in rows}, key=lambda s: (s.split(" · ")[0], s), reverse=True)
+        counts = {n: sum(e["session"] == n for e in rows) for n in names}
+        ctx["session_names"] = {f"{n} ({counts[n]} takes)": n for n in names}
+        set_options(sess, ctx["session_names"], sess.value)
+        refresh_scenes()
+
+    def refresh_scenes():
+        rows = [e for e in visible_entries() if e["session"] == ctx["session_names"].get(sess.value)]
+        order = list(dict.fromkeys(e["scene_id"] for e in sorted(rows, key=lambda e: e["stamp"])))
+        counts = {s: sum(e["scene_id"] == s for e in rows) for s in order}
+        ctx["scene_names"] = {f"{s} ({counts[s]})": s for s in order}
+        set_options(scn, ctx["scene_names"], scn.value)
+        refresh_takes()
+
+    def refresh_takes():
+        scene_id = ctx["scene_names"].get(scn.value)
+        rows = sorted([e for e in visible_entries() if e["session"] == ctx["session_names"].get(sess.value)
+                       and e["scene_id"] == scene_id],
+                      key=lambda e: (e["seg"]["route_id"], e["seg"]["route_s0_m"], e["stamp"]))
+        ctx["entries"], ctx["labels"] = rows, [entry_label(e) for e in rows]
+        if not rows:
+            info.content = "no takes for this choice"
+            return
+        if rows[0]["scene_json"] != ctx["scene_json"]:
+            build_room(rows[0]["scene_json"])
+            for client in server.get_clients().values():   # look at the new room
+                with client.atomic():
+                    client.camera.position, client.camera.look_at = ctx["overview_cam"] if "overview_cam" in ctx \
+                        else (client.camera.position, client.camera.look_at)
+        build_overview(rows)
+        set_options(pick, ctx["labels"])
+        select(0)
+
+    def guarded(fn):
+        def cb(_):
+            if ctx["busy"]:
+                return
+            ctx["busy"] = True
+            try:
+                fn()
+            finally:
+                ctx["busy"] = False
+        return cb
+
+    @reload_btn.on_click
+    def _(_):
+        """Rescan the takes folder; new takes appear without restarting the viewer."""
+        if ctx["busy"]:
+            return
+        ctx["busy"] = True
+        try:
+            known = {e["path"] for e in entries}
+            entries[:] = rescan()
+            new = [e for e in entries if e["path"] not in known]
+            refresh_sessions()
+            info.content = (f"reloaded: {len(entries)} takes, {len(new)} new" +
+                            ("  \n" + "  \n".join(e["id"] for e in new[:8]) if new else "") + "  \n\n" + info.content)
+        finally:
+            ctx["busy"] = False
+
+    flt.on_update(guarded(refresh_sessions))
+    sess.on_update(guarded(refresh_scenes))
+    scn.on_update(guarded(refresh_takes))
+    pick.on_update(guarded(lambda: select(ctx["labels"].index(pick.value)) if pick.value in ctx["labels"] else None))
+
+    def advance():
+        """Next take in the list (wraps), for auto-advance."""
+        if len(ctx["entries"]) > 1 and pick.value in ctx["labels"]:
+            pick.value = ctx["labels"][(ctx["labels"].index(pick.value) + 1) % len(ctx["labels"])]
     @slider.on_update
     def _(_):
         with lock:
             draw(int(slider.value))
 
-    # camera: over the whole set of routes, from behind the first segment start
-    pts = np.vstack([np.asarray(tk.seg["route"], float) for tk in takes])
-    mid, span = pts.mean(0), max(np.ptp(pts, axis=0).max(), 2.0)
-    sx, sy, syaw = takes[0].seg["start"]
-    fx, fy = np.cos(syaw), np.sin(syaw)
-    server.initial_camera.position = (mid[0] - .9 * span * fx + .5 * span * fy, mid[1] - .9 * span * fy - .5 * span * fx,
-                                      .9 * span + 1)
-    server.initial_camera.look_at = (mid[0], mid[1], .6)
+    # first view: the newest session's first scene; the camera over its routes
+    ctx["busy"] = True
+    try:
+        refresh_sessions()
+    finally:
+        ctx["busy"] = False
+    server.initial_camera.position, server.initial_camera.look_at = ctx["overview_cam"]
     server.initial_camera.up_direction = (0, 0, 1)
 
     def follow(client):
@@ -673,9 +959,9 @@ def serve(take_paths, port):
         c, s = np.cos(yaw), np.sin(yaw)
         return (h[0] - 1.6 * c + .7 * s, h[1] - 1.6 * s - .7 * c, 1.9), (h[0] + .8 * c, h[1] + .8 * s, .8)
     views = {
-        "Overview": lambda c: (server.initial_camera.position, server.initial_camera.look_at),
+        "Overview": lambda c: ctx["overview_cam"],
         "Behind the operator (now)": follow,
-        "Top": lambda c: ((mid[0], mid[1], 1.6 * span + 2), (mid[0] + 1e-3, mid[1], 0.0)),
+        "Top": lambda c: ctx["top_cam"],
     }
     with server.gui.add_folder("Cameras", expand_by_default=False):
         for label, fn in views.items():
@@ -689,54 +975,58 @@ def serve(take_paths, port):
                         event.client.camera.position, event.client.camera.look_at = p, target
                         event.client.camera.up_direction = (0, 0, 1)
 
-    select(0)
-    print(f"http://127.0.0.1:{server.get_port()}   {data['scene_id']}: {len(takes)} take(s)", flush=True)
-    return server, takes, cur, slider, playing, speed, auto, pick, labels
+    n_sessions = len({e["session"] for e in entries})
+    n_scenes = len({e["scene_id"] for e in entries})
+    print(f"http://127.0.0.1:{server.get_port()}   {len(entries)} takes · {n_sessions} sessions · {n_scenes} scenes",
+          flush=True)
+    return dict(server=server, cur=cur, slider=slider, playing=playing, speed=speed, auto=auto, advance=advance,
+                lock=lock, ctx=ctx, pick=pick, sess=sess, scn=scn, flt=flt, pov_btn=pov_btn, pov_on=pov_on, reload_btn=reload_btn)
 
 
-def run(groups, port):
-    servers = [serve(paths, port + k) for k, paths in enumerate(groups)]
-    last = time.monotonic()
+def run(entries, port, initial_filter, rescan=None):
+    v = serve(entries, port, initial_filter, rescan)
+    cur, slider, playing, speed = v["cur"], v["slider"], v["playing"], v["speed"]
     try:
         while True:
             time.sleep(0.01)
-            now = time.monotonic()
-            for server, takes, cur, slider, playing, speed, auto, pick, labels in servers:
-                tk = cur["take"]
-                dt = float(np.median(np.diff(tk.t))) if tk.n > 1 else 0.05
-                if not playing.value or now - cur.get("last", 0) < dt / float(speed.value):
-                    continue
-                cur["last"] = now
-                i = int(slider.value) + 1
-                if i < tk.n:
-                    slider.value = i
-                elif auto.value and len(takes) > 1:
-                    pick.value = labels[(takes.index(tk) + 1) % len(takes)]
-                else:
-                    slider.value = 0
+            tk, now = cur["take"], time.monotonic()
+            if tk is None or v["ctx"]["busy"]:
+                continue
+            dt = float(np.median(np.diff(tk.t))) if tk.n > 1 else 0.05
+            if not playing.value or now - cur.get("last", 0) < dt / float(speed.value):
+                continue
+            cur["last"] = now
+            i = int(slider.value) + 1
+            if i < tk.n:
+                slider.value = i
+            elif v["auto"].value and len(v["ctx"]["entries"]) > 1:
+                v["advance"]()
+            else:
+                slider.value = 0
     except KeyboardInterrupt:
-        for s in servers:
-            s[0].stop()
+        v["server"].stop()
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["prepare", "serve"])
-    p.add_argument("takes", nargs="*", help="take directories")
-    p.add_argument("--successful", action="store_true", help="every take with status success and safe")
+    p.add_argument("takes", nargs="*", help="take directories (serve: default every take in --takes-dir)")
+    p.add_argument("--successful", action="store_true",
+                   help="prepare: every safe success; serve: start with the safe-successes filter (the default)")
+    p.add_argument("--show", choices=list(FILTERS), default="safe successes", help="serve: initial take filter")
     p.add_argument("--takes-dir", default=TAKES)
-    p.add_argument("--port", type=int, default=8110, help="first port (one per scene)")
+    p.add_argument("--port", type=int, default=8110)
     a = p.parse_args()
-    takes = list(a.takes) + (successful_takes(a.takes_dir) if a.successful else [])
-    if not takes:
-        raise SystemExit("no takes (pass take directories or --successful)")
     if a.command == "prepare":
+        takes = list(a.takes) + (successful_takes(a.takes_dir) if a.successful else [])
+        if not takes:
+            raise SystemExit("no takes (pass take directories or --successful)")
         prepare(takes)
         return
-    groups = {}
-    for t in takes:
-        groups.setdefault(scene_json_of(t, load_meta(t)), []).append(t)
-    run(list(groups.values()), a.port)
+    entries = catalog(a.takes_dir, [os.path.abspath(t) for t in a.takes] if a.takes else None)
+    paths = [os.path.abspath(t) for t in a.takes] if a.takes else None
+    run(entries, a.port, "safe successes" if a.successful else a.show,
+        rescan=None if paths else (lambda: catalog(a.takes_dir)))
 
 
 if __name__ == "__main__":
